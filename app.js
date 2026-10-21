@@ -371,73 +371,156 @@ function parseCsv(text) {
   }
   return result;
 }
-function importFile(db, kind) {
-  const input = el("input", {
-    type: "file",
-    accept: kind === "csv" ? ".csv,text/csv" : ".json,application/json",
+function decodeCsv(bytes, encoding = "auto") {
+  const codecs = encoding === "auto" ? ["utf-8", "shift_jis"] : [encoding];
+  for (const codec of codecs) {
+    try {
+      return {
+        text: new TextDecoder(codec, { fatal: true })
+          .decode(bytes)
+          .replace(/^\ufeff/, ""),
+        encoding: codec,
+      };
+    } catch {}
+  }
+  throw Error(
+    "文字コードを判定できません。UTF-8またはShift_JIS（CP932）のCSVを指定してください。",
+  );
+}
+function csvImportDialog(db) {
+  const fileInput = el("input", { type: "file", accept: ".csv,text/csv" });
+  const encoding = el("select");
+  for (const [value, label] of [
+    ["auto", "自動判定（UTF-8 / Shift_JIS）"],
+    ["utf-8", "UTF-8"],
+    ["shift_jis", "Shift_JIS（CP932）"],
+  ])
+    encoding.append(el("option", { value, text: label }));
+  const info = el("p", {
+    class: "muted",
+    text: "CSVの見出し名がデータベースの項目名と一致する列を取り込みます。",
   });
+  const panel = el(
+    "div",
+    { class: "panel" },
+    heading("CSV取込", "文字化けする場合は文字コードを手動選択してください。"),
+    el(
+      "div",
+      { class: "field" },
+      el("label", { text: "CSVファイル" }),
+      fileInput,
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("label", { text: "文字コード" }),
+      encoding,
+    ),
+    info,
+  );
+  panel.append(
+    el(
+      "div",
+      { class: "actions" },
+      btn(
+        "取り込む",
+        async () => {
+          const file = fileInput.files?.[0];
+          if (!file) {
+            alert("CSVファイルを選択してください。");
+            return;
+          }
+          try {
+            const bytes = await file.arrayBuffer();
+            const decoded = decodeCsv(bytes, encoding.value);
+            const records = parseCsv(decoded.text);
+            if (records.length < 1) throw Error("CSVに見出し行がありません");
+            const headers = records.shift().map((h) => h.trim());
+            if (new Set(headers).size !== headers.length)
+              throw Error("CSVの見出しが重複しています");
+            const indices = db.fields.map((f) => headers.indexOf(f.label));
+            if (indices.every((i) => i < 0))
+              throw Error(
+                "一致する見出し項目がありません。CSVの1行目とDBの見出し名を確認してください。",
+              );
+            const additions = records
+              .filter((r) => r.some((v) => v !== ""))
+              .map((r) => ({
+                id: uid(),
+                values: Object.fromEntries(
+                  db.fields.map((f, i) => [
+                    f.id,
+                    indices[i] < 0 ? "" : displayValue(r[indices[i]]),
+                  ]),
+                ),
+              }));
+            if (!additions.length) {
+              alert("取り込むレコードがありません");
+              return;
+            }
+            const names = { "utf-8": "UTF-8", shift_jis: "Shift_JIS（CP932）" };
+            if (
+              !confirm(
+                `文字コード: ${names[decoded.encoding]}\n${additions.length}件のレコードを「${db.name}」に追加します。既存データは保持されます。続けますか？`,
+              )
+            )
+              return;
+            if (mutate(() => db.rows.push(...additions))) renderDb();
+          } catch (e) {
+            alert("CSV取込失敗: " + e.message);
+          }
+        },
+        "primary",
+      ),
+      btn("キャンセル", renderDb),
+    ),
+  );
+  dbLayout(el("div", {}, btn("← データ一覧に戻る", renderDb, "back"), panel));
+}
+function importFile(db, kind) {
+  if (kind === "csv") {
+    csvImportDialog(db);
+    return;
+  }
+  const input = el("input", { type: "file", accept: ".json,application/json" });
   input.addEventListener("change", async () => {
     const file = input.files?.[0];
     if (!file) return;
     try {
       const content = (await file.text()).replace(/^\ufeff/, "");
-      let additions = [];
-      if (kind === "csv") {
-        const records = parseCsv(content);
-        if (records.length < 1) throw Error("CSVに見出し行がありません");
-        const headers = records.shift();
-        if (new Set(headers).size !== headers.length)
-          throw Error("CSVの見出しが重複しています");
-        const indices = db.fields.map((f) => headers.indexOf(f.label));
-        if (indices.every((i) => i < 0))
-          throw Error("一致する見出し項目がありません");
-        additions = records
-          .filter((r) => r.some((v) => v !== ""))
-          .map((r) => ({
-            id: uid(),
-            values: Object.fromEntries(
-              db.fields.map((f, i) => [
-                f.id,
-                indices[i] < 0 ? "" : displayValue(r[indices[i]]),
-              ]),
-            ),
-          }));
-      } else {
-        const data = JSON.parse(content),
-          source = data?.database ?? data;
-        if (
-          !source ||
-          !Array.isArray(source.fields) ||
-          !Array.isArray(source.rows)
+      const data = JSON.parse(content),
+        source = data?.database ?? data;
+      if (
+        !source ||
+        !Array.isArray(source.fields) ||
+        !Array.isArray(source.rows)
+      )
+        throw Error("FlexDBのJSON形式ではありません");
+      const labels = source.fields.map((f) => f.label);
+      if (new Set(labels).size !== labels.length)
+        throw Error("JSONの項目名が重複しています");
+      if (
+        source.fields.some(
+          (f) => typeof f.id !== "string" || typeof f.label !== "string",
+        ) ||
+        source.rows.some(
+          (r) => !r || typeof r.values !== "object" || r.values === null,
         )
-          throw Error("FlexDBのJSON形式ではありません");
-        const labels = source.fields.map((f) => f.label);
-        if (new Set(labels).size !== labels.length)
-          throw Error("JSONの項目名が重複しています");
-        if (
-          source.fields.some(
-            (f) => typeof f.id !== "string" || typeof f.label !== "string",
-          ) ||
-          source.rows.some(
-            (r) => !r || typeof r.values !== "object" || r.values === null,
-          )
-        )
-          throw Error("JSONデータが不正です");
-        const map = db.fields.map(
-          (f) => source.fields.find((sf) => sf.label === f.label)?.id,
-        );
-        if (map.every((id) => !id))
-          throw Error("一致する見出し項目がありません");
-        additions = source.rows.map((r) => ({
-          id: uid(),
-          values: Object.fromEntries(
-            db.fields.map((f, i) => [
-              f.id,
-              map[i] ? displayValue(r.values[map[i]]) : "",
-            ]),
-          ),
-        }));
-      }
+      )
+        throw Error("JSONデータが不正です");
+      const map = db.fields.map(
+        (f) => source.fields.find((sf) => sf.label === f.label)?.id,
+      );
+      if (map.every((id) => !id)) throw Error("一致する見出し項目がありません");
+      const additions = source.rows.map((r) => ({
+        id: uid(),
+        values: Object.fromEntries(
+          db.fields.map((f, i) => [
+            f.id,
+            map[i] ? displayValue(r.values[map[i]]) : "",
+          ]),
+        ),
+      }));
       if (!additions.length) {
         alert("取り込むレコードがありません");
         return;
@@ -456,6 +539,63 @@ function importFile(db, kind) {
   input.click();
 }
 
+function formatMenu(db, mode) {
+  const isExport = mode === "export";
+  const panel = el(
+    "div",
+    { class: "panel" },
+    heading(
+      isExport ? "データをエクスポートする" : "データを取り込む",
+      `${db.name} — ファイル形式を選択してください。`,
+    ),
+  );
+  if (!isExport)
+    panel.append(
+      el("p", {
+        class: "notice",
+        text: "取り込んだデータは既存のレコードに追加されます。見出し名が一致する項目だけが対象です。",
+      }),
+    );
+  panel.append(
+    el(
+      "div",
+      { class: "actions" },
+      btn(
+        "CSV形式",
+        () => (isExport ? (exportCsv(db), renderDb()) : csvImportDialog(db)),
+        "primary",
+      ),
+      btn(
+        "JSON形式",
+        () =>
+          isExport ? (exportJson(db), renderDb()) : importFile(db, "json"),
+        "subtle",
+      ),
+      btn("キャンセル", renderDb),
+    ),
+  );
+  dbLayout(el("div", {}, btn("← データ一覧に戻る", renderDb, "back"), panel));
+}
+function clearAllRows(db) {
+  if (!db.rows.length) {
+    alert("削除するデータがありません。");
+    return;
+  }
+  if (
+    !confirm(
+      `「${db.name}」の登録データ ${db.rows.length} 件をすべて削除します。\n見出し項目とデータベース自体は残ります。\nこの操作は取り消せません。実行しますか？`,
+    )
+  )
+    return;
+  if (
+    mutate(() => {
+      db.rows = [];
+    })
+  ) {
+    query = "";
+    renderDb();
+  }
+}
 function renderDb() {
   const db = databases.find((d) => d.id === currentId);
   if (!db) return home();
@@ -585,10 +725,9 @@ function renderDb() {
         { class: "actions" },
         btn("＋ データ登録", () => recordScreen(db), "primary"),
         btn("項目を設定", () => schemaScreen(db, () => renderDb()), ""),
-        btn("CSV出力", () => exportCsv(db), "small"),
-        btn("CSV取込", () => importFile(db, "csv"), "small"),
-        btn("JSON出力", () => exportJson(db), "small"),
-        btn("JSON取込", () => importFile(db, "json"), "small"),
+        btn("エクスポート", () => formatMenu(db, "export"), "small"),
+        btn("インポート", () => formatMenu(db, "import"), "small"),
+        btn("データ全削除", () => clearAllRows(db), "danger small"),
         btn(
           "DB削除",
           () => {
